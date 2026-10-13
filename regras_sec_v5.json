@@ -1,0 +1,276 @@
+{
+  // =====================================================================
+  //  PRESENÇA INTELIGENTE — INSTÂNCIA sistfrequenciareitor
+  //  Regras de Segurança (Realtime Database)
+  //  Versão SEC-V5 / LGPD-V1 (três perfis) — inclui SEC-V2 a SEC-V4
+  //  TURNO-ALERTA-V1 (alerta de horário fora do turno) não aparece aqui de
+  //           propósito: é calculado na tela, nada novo é gravado no banco.
+  //  LGPD-V1: CPF/RG de visitantes em /visitantes_privado (só coordenação);
+  //           /alunos guarda só o final (docFinal); /registros não guarda CPF.
+  //           Publicar SOMENTE depois do index.html LGPD-V1 estar no ar.
+  //  SEC-V4: ciclos ganham entradaTs/saidaTs (horário do servidor, now).
+  //          Publicar SOMENTE depois do index.html SEC-V4 estar no ar.
+  //  SEC-V3: /logs_acoes/ts passa a exigir o horário do servidor (now).
+  //          Publicar SOMENTE depois do index.html SEC-V3 estar no ar.
+  //
+  //  INSTÂNCIA: sistfrequenciareitor
+  //  Projeto Firebase: sistfrequenciareitor-3535a
+  //  Banco: https://sistfrequenciareitor-3535a-default-rtdb.firebaseio.com
+  //  Casa com o index.html desta instância (SRI + CSP + XSS-V1).
+  //
+  //  O QUE MUDOU EM RELAÇÃO À AUTH-V1  [SEC-V2]
+  //   1. /registros: o operador deixou de poder REESCREVER o histórico.
+  //      Ele só consegue CRIAR uma entrada nova e FECHAR uma saída em
+  //      aberto. Não altera horários já gravados, não apaga ciclos, não
+  //      troca a autoria e não cria registro para aluno inexistente.
+  //   2. /registros: a autoria do ciclo (entradaPorUid / saidaPorUid)
+  //      precisa ser o próprio usuário logado — ninguém registra em nome
+  //      de outro porteiro.
+  //   3. /logs_acoes: o log não aceita mais uid falso, perfil falso nem
+  //      data absurda. Campos essenciais passaram a ser obrigatórios.
+  //   4. /usuarios: o super_admin não consegue rebaixar nem desativar a
+  //      si mesmo (evita a escola ficar sem nenhum super_admin).
+  //   5. /alunos e /configuracoes: tamanho máximo e campos obrigatórios.
+  //
+  //  operador     nível 1 — portaria. Lê alunos, registra entrada/saída,
+  //                         grava observação. Não cadastra, não apaga.
+  //  admin        nível 2 — coordenação. Tudo do operador + cadastro,
+  //                         importação, configurações, exclusões,
+  //                         correções de histórico e limpeza de log.
+  //  super_admin  nível 3 — tudo do admin + criar, editar e desativar
+  //                         usuários.
+  // =====================================================================
+
+  "rules": {
+
+    // Nada é público. Todo caminho não previsto abaixo fica bloqueado.
+    ".read": false,
+    ".write": false,
+
+    // -----------------------------------------------------------------
+    // /usuarios
+    // -----------------------------------------------------------------
+    "usuarios": {
+      ".read": "auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true && root.child('usuarios').child(auth.uid).child('perfil').val() === 'super_admin'",
+      ".write": "auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true && root.child('usuarios').child(auth.uid).child('perfil').val() === 'super_admin'",
+
+      "$uid": {
+        ".read": "auth != null && auth.uid === $uid",
+        // [SEC-V2] Registro completo + o super_admin não se rebaixa nem se desativa
+        ".validate": "newData.hasChildren(['perfil', 'ativo']) && ($uid !== auth.uid || (newData.child('perfil').val() === 'super_admin' && newData.child('ativo').val() === true))",
+
+        "nome":     { ".validate": "newData.isString() && newData.val().length > 0 && newData.val().length <= 120" },
+        "email":    { ".validate": "newData.isString() && newData.val().length <= 160" },
+        "perfil":   { ".validate": "newData.isString() && (newData.val() === 'operador' || newData.val() === 'admin' || newData.val() === 'super_admin')" },
+        "ativo":    { ".validate": "newData.isBoolean()" },
+        "criadoEm": { ".validate": "newData.isString() && newData.val().length <= 20" },
+        "$outro":   { ".validate": false }
+      }
+    },
+
+    // -----------------------------------------------------------------
+    // /configuracoes — nome da instituição, diretor, INEP e logo
+    // -----------------------------------------------------------------
+    "configuracoes": {
+      ".read": "auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true",
+      ".write": "(auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true && (root.child('usuarios').child(auth.uid).child('perfil').val() === 'admin' || root.child('usuarios').child(auth.uid).child('perfil').val() === 'super_admin'))",
+
+      // [SEC-V2] limites de tamanho
+      "nomeInstituicao":      { ".validate": "newData.isString() && newData.val().length <= 200" },
+      "nomeDiretor":          { ".validate": "newData.isString() && newData.val().length <= 300" },
+      "matriculaInstituicao": { ".validate": "newData.isString() && newData.val().length <= 60" },
+      "logo":                 { ".validate": "newData.isString() && newData.val().length <= 700000" },
+      "$outro":               { ".validate": "newData.isString() && newData.val().length <= 2000" }
+    },
+
+    // -----------------------------------------------------------------
+    // /alunos — DADOS PESSOAIS DE MENORES
+    //   Leitura: usuário ativo (a portaria confere nome e foto no QR).
+    //   Escrita: admin ou super_admin.
+    // -----------------------------------------------------------------
+    "alunos": {
+      ".read": "auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true",
+      ".write": "(auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true && (root.child('usuarios').child(auth.uid).child('perfil').val() === 'admin' || root.child('usuarios').child(auth.uid).child('perfil').val() === 'super_admin'))",
+
+      "$chave": {
+        // [SEC-V2] chave com tamanho limitado e nome obrigatório
+        ".validate": "$chave.length <= 100 && newData.hasChild('nome')",
+
+        "nome":         { ".validate": "newData.isString() && newData.val().length > 0 && newData.val().length <= 120" },
+        "matricula":    { ".validate": "newData.isString() && newData.val().length <= 40" },
+        "turma":        { ".validate": "newData.isString() && newData.val().length <= 60" },
+        "turno":        { ".validate": "newData.isString() && newData.val().length <= 30" },
+        "modalidade":   { ".validate": "newData.isString() && newData.val().length <= 40" },
+        "ano":          { ".validate": "newData.isString() && newData.val().length <= 40" },
+        // [LGPD-V1] CPF/RG saiu daqui (vai para /visitantes_privado). Só aceita
+        //           vazio, para telas antigas ainda abertas não travarem.
+        "cpf":          { ".validate": "newData.isString() && newData.val() === ''" },
+        "docFinal":     { ".validate": "newData.isString() && newData.val().length <= 8" },
+        "tipoVisita":   { ".validate": "newData.isString() && newData.val().length <= 120" },
+        "dataCadastro": { ".validate": "newData.isString() && newData.val().length <= 20" },
+        "foto":         { ".validate": "newData.isString() && newData.val().length <= 480000" },
+        "$outro":       { ".validate": false }
+      }
+    },
+
+    // -----------------------------------------------------------------
+    // /visitantes_privado — [LGPD-V1] CPF/RG completo dos visitantes
+    //   Só a coordenação (admin/super_admin) lê e grava. A portaria vê
+    //   apenas o final do documento (alunos/$chave/docFinal).
+    // -----------------------------------------------------------------
+    "visitantes_privado": {
+      ".read": "(auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true && (root.child('usuarios').child(auth.uid).child('perfil').val() === 'admin' || root.child('usuarios').child(auth.uid).child('perfil').val() === 'super_admin'))",
+      ".write": "(auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true && (root.child('usuarios').child(auth.uid).child('perfil').val() === 'admin' || root.child('usuarios').child(auth.uid).child('perfil').val() === 'super_admin'))",
+      "$chave": {
+        ".validate": "$chave.length <= 100 && newData.hasChild('cpf')",
+        "cpf":    { ".validate": "newData.isString() && newData.val().length > 0 && newData.val().length <= 20" },
+        "$outro": { ".validate": false }
+      }
+    },
+
+    // -----------------------------------------------------------------
+    // /registros — entradas e saídas por dia
+    //   admin/super_admin: controle total do dia (corrigir, apagar,
+    //     restaurar backup) pelo .write em $data.
+    //   operador: [SEC-V2] NÃO existe mais .write em $aluno (ele liberava
+    //     o nó inteiro e permitia reescrever horários e apagar ciclos).
+    //     Agora cada campo tem a sua própria permissão:
+    //       - dados do aluno (nome, turma...): só na criação do registro;
+    //       - entrada e autoria da entrada: só se ainda não existirem;
+    //       - saída e autoria da saída: só se a saída estiver em aberto;
+    //       - obs: pode gravar e alterar;
+    //       - apagar qualquer coisa: nunca.
+    //   Em tudo isso o aluno precisa existir em /alunos.
+    // -----------------------------------------------------------------
+    "registros": {
+      ".read": "auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true",
+
+      "$data": {
+        ".write": "(auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true && (root.child('usuarios').child(auth.uid).child('perfil').val() === 'admin' || root.child('usuarios').child(auth.uid).child('perfil').val() === 'super_admin'))",
+        ".validate": "$data.matches(/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/)",
+
+        "$aluno": {
+          ".validate": "$aluno.length <= 100",
+
+          "obs": {
+            ".write": "auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true && newData.exists() && root.child('alunos').child($aluno).exists()",
+            ".validate": "newData.isString() && newData.val().length <= 500"
+          },
+
+          "ciclos": {
+            "$idx": {
+              ".validate": "$idx.matches(/^[0-9]{1,3}$/)",
+
+              "entrada": {
+                ".write": "auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true && !data.exists() && newData.exists() && root.child('alunos').child($aluno).exists()",
+                ".validate": "newData.isString() && newData.val().length <= 40"
+              },
+              "entradaPorNome": {
+                ".write": "auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true && !data.exists() && newData.exists() && root.child('alunos').child($aluno).exists()",
+                ".validate": "newData.isString() && newData.val().length <= 120"
+              },
+              "entradaPorPerfil": {
+                ".write": "auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true && !data.exists() && newData.exists() && root.child('alunos').child($aluno).exists()",
+                ".validate": "newData.isString() && ((auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true && (root.child('usuarios').child(auth.uid).child('perfil').val() === 'admin' || root.child('usuarios').child(auth.uid).child('perfil').val() === 'super_admin')) || newData.val() === root.child('usuarios').child(auth.uid).child('perfil').val())"
+              },
+              "entradaPorUid": {
+                ".write": "auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true && !data.exists() && newData.exists() && root.child('alunos').child($aluno).exists()",
+                ".validate": "newData.isString() && ((auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true && (root.child('usuarios').child(auth.uid).child('perfil').val() === 'admin' || root.child('usuarios').child(auth.uid).child('perfil').val() === 'super_admin')) || newData.val() === auth.uid)"
+              },
+
+              // [SEC-V4] carimbo do servidor: o operador só grava o horário real (now);
+              //          o admin fica livre para corrigir e restaurar backup
+              "entradaTs": {
+                ".write": "auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true && !data.exists() && newData.exists() && root.child('alunos').child($aluno).exists()",
+                ".validate": "newData.isNumber() && (newData.val() === now || (auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true && (root.child('usuarios').child(auth.uid).child('perfil').val() === 'admin' || root.child('usuarios').child(auth.uid).child('perfil').val() === 'super_admin')))"
+              },
+              "saidaTs": {
+                ".write": "auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true && !data.exists() && newData.exists() && root.child('alunos').child($aluno).exists()",
+                ".validate": "newData.isNumber() && (newData.val() === now || (auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true && (root.child('usuarios').child(auth.uid).child('perfil').val() === 'admin' || root.child('usuarios').child(auth.uid).child('perfil').val() === 'super_admin')))"
+              },
+
+              "saida": {
+                ".write": "auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true && newData.exists() && (!data.exists() || data.val() === '') && root.child('alunos').child($aluno).exists()",
+                ".validate": "newData.isString() && newData.val().length <= 40"
+              },
+              "saidaPorNome": {
+                ".write": "auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true && !data.exists() && newData.exists() && root.child('alunos').child($aluno).exists()",
+                ".validate": "newData.isString() && newData.val().length <= 120"
+              },
+              "saidaPorPerfil": {
+                ".write": "auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true && !data.exists() && newData.exists() && root.child('alunos').child($aluno).exists()",
+                ".validate": "newData.isString() && ((auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true && (root.child('usuarios').child(auth.uid).child('perfil').val() === 'admin' || root.child('usuarios').child(auth.uid).child('perfil').val() === 'super_admin')) || newData.val() === root.child('usuarios').child(auth.uid).child('perfil').val())"
+              },
+              "saidaPorUid": {
+                ".write": "auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true && !data.exists() && newData.exists() && root.child('alunos').child($aluno).exists()",
+                ".validate": "newData.isString() && ((auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true && (root.child('usuarios').child(auth.uid).child('perfil').val() === 'admin' || root.child('usuarios').child(auth.uid).child('perfil').val() === 'super_admin')) || newData.val() === auth.uid)"
+              },
+
+              // Campos futuros do ciclo: só o admin grava (via $data), com limite de tamanho
+              "$outro": { ".validate": "newData.isString() && newData.val().length <= 200" }
+            }
+          },
+
+          // [LGPD-V1] CPF/RG não é mais copiado para o histórico: só vazio
+          "cpf": {
+            ".write": "auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true && !data.exists() && newData.exists() && root.child('alunos').child($aluno).exists()",
+            ".validate": "newData.isString() && newData.val() === ''"
+          },
+
+          // nome, matricula, turma, turno, modalidade, ano, tipoVisita:
+          // o operador grava só na criação do registro do dia.
+          "$campo": {
+            ".write": "auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true && !data.exists() && newData.exists() && root.child('alunos').child($aluno).exists()",
+            ".validate": "newData.isString() && newData.val().length <= 120 && ((auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true && (root.child('usuarios').child(auth.uid).child('perfil').val() === 'admin' || root.child('usuarios').child(auth.uid).child('perfil').val() === 'super_admin')) || $campo.matches(/^(nome|matricula|turma|turno|modalidade|ano|tipoVisita)$/))"
+          }
+        }
+      }
+    },
+
+    // -----------------------------------------------------------------
+    // /logs_acoes — trilha de auditoria (append-only para o operador)
+    // -----------------------------------------------------------------
+    "logs_acoes": {
+      ".read": "auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true",
+      ".write": "(auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true && (root.child('usuarios').child(auth.uid).child('perfil').val() === 'admin' || root.child('usuarios').child(auth.uid).child('perfil').val() === 'super_admin'))",
+
+      "$id": {
+        ".write": "auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true && !data.exists() && newData.exists()",
+        // [SEC-V2] campos essenciais obrigatórios
+        ".validate": "newData.hasChildren(['acao', 'tipo', 'uid', 'ts'])",
+
+        "aba":      { ".validate": "newData.isString() && newData.val().length <= 60" },
+        "acao":     { ".validate": "newData.isString() && newData.val().length <= 120" },
+        "detalhe":  { ".validate": "newData.isString() && newData.val().length <= 1000" },
+        "tipo":     { ".validate": "newData.isString() && newData.val().length <= 40" },
+        "dataHora": { ".validate": "newData.isString() && newData.val().length <= 60" },
+        // [SEC-V3] horário do servidor: o app grava ServerValue.TIMESTAMP;
+        //          qualquer horário vindo do relógio do aparelho é recusado
+        "ts":       { ".validate": "newData.isNumber() && newData.val() === now" },
+        "usuario":  { ".validate": "newData.isString() && newData.val().length <= 120" },
+        // [SEC-V2] ninguém grava log em nome de outra pessoa
+        "uid":      { ".validate": "newData.isString() && newData.val() === auth.uid" },
+        // [SEC-V2] o perfil gravado precisa ser o perfil real de quem grava
+        "perfil":   { ".validate": "newData.isString() && (newData.val() === '' || newData.val() === root.child('usuarios').child(auth.uid).child('perfil').val())" },
+        "$outro":   { ".validate": false }
+      }
+    },
+
+    // -----------------------------------------------------------------
+    // /backupExclusoes — cópia da última exclusão (botão Desfazer)
+    // -----------------------------------------------------------------
+    "backupExclusoes": {
+      ".read": "(auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true && (root.child('usuarios').child(auth.uid).child('perfil').val() === 'admin' || root.child('usuarios').child(auth.uid).child('perfil').val() === 'super_admin'))",
+      ".write": "(auth != null && root.child('usuarios').child(auth.uid).child('ativo').val() === true && (root.child('usuarios').child(auth.uid).child('perfil').val() === 'admin' || root.child('usuarios').child(auth.uid).child('perfil').val() === 'super_admin'))",
+
+      "ultimo": {
+        "aba":      { ".validate": "newData.isString() && newData.val().length <= 60" },
+        "origem":   { ".validate": "newData.isString() && newData.val().length <= 160" },
+        "resumo":   { ".validate": "newData.isString() && newData.val().length <= 300" },
+        "dataHora": { ".validate": "newData.isString() && newData.val().length <= 60" },
+        "usuario":  { ".validate": "newData.isString() && newData.val().length <= 120" },
+        "ts":       { ".validate": "newData.isNumber()" }
+      }
+    }
+  }
+}
